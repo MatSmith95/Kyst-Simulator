@@ -195,8 +195,10 @@ class ProtocolHandler:
             return self._reply_ack()
 
         elif cmd == TypeCCmd.DIP_SWITCH:
-            option = 0x40  # placeholder OPTION nibble
-            node  = self.state.node_address & 0x0F
+            # OPTION nibble (high) = 0x4, NODE nibble (low) = node address
+            # Clamp to 0xFF max — option=4, node=0..F
+            option = 0x4
+            node   = self.state.node_address & 0x0F
             return build_slave_reply(bytes([(option << 4) | node]))
 
         elif cmd == TypeCCmd.RESET_OUTPUTS:
