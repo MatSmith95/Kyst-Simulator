@@ -7,16 +7,22 @@
     },
     "serial": {
       "port": "COM1",
-      "baud_rate": 9600,
+      "baud_rate": 57600,
+      "data_bits": 8,
       "parity": "N",
-      "stop_bits": 1,
-      "data_bits": 8
+      "stop_bits": 1.0,
+      "read_timeout": 1.0
     }
   },
   "device": {
+    "node_address": 1,
     "online": true,
+    "reset_flag": true,
     "simulate_fault": false,
-    "auto_respond": true
+    "auto_respond": true,
+    "reply_delay_100us": 20,
+    "board_temp_raw": 13615,
+    "board_voltage_raw": 2400
   },
   "logging": {
     "level": "INFO"
