@@ -1,10 +1,18 @@
 """
 D2-Bus Protocol Handler — Slave Mode
 
-Receives a parsed MasterTelegram and returns the correct slave reply bytes
-based on the simulated device state.
+Full AE99 channel complement:
+  Inputs  (slave → master):
+    AIN  0–20   21 analog inputs     (16-bit, 3 banks)
+    DIN  21–23   3 digital inputs     (in AIN bank 2)
+    CNT  0–15   16 counter inputs    (2 banks × 8, 16-bit)
+    ENC  0–11   12 encoder inputs    (3 banks × 4, 16-bit)
+    DIG  0–23   24 digital inputs    (3 bytes, 1 bit per channel)
+    TEMP 1–4     4 temperature inputs (16-bit, degree C = (raw/100)−100)
 
-This is the core of the simulator — all Kyst card behaviour lives here.
+  Outputs (master → slave):
+    PWM  0–23   24 PWM outputs       (8-bit or 16-bit, 3 banks)
+    APW  0–23   24 analog power enables (1 bit per output)
 """
 
 from __future__ import annotations
@@ -20,59 +28,66 @@ from simulator.telegram import (
 logger = logging.getLogger(__name__)
 
 
-# ── Simulated device state ────────────────────────────────────────────────────
-
 @dataclass
 class DeviceState:
-    """
-    Holds the full simulated state of a Kyst AE99 drivercard.
-    All values here are what the simulator will report back to the PLC.
-    """
+    """Complete simulated state of an AE99 Kyst card."""
 
     # ── Identity ──────────────────────────────────────────────────────────────
-    node_address: int = 0x1          # DIP switch node (0x0–0xF)
-    fw_version: int = 0x02
-    fw_sub_version: int = 0x03
-    fw_day: int = 0x01
-    fw_month: int = 0x01
-    fw_year: int = 0x25              # year 2025 = 25
+    node_address:    int = 0x1
+    fw_version:      int = 0x02
+    fw_sub_version:  int = 0x03
+    fw_day:          int = 0x01
+    fw_month:        int = 0x01
+    fw_year:         int = 0x25
 
-    # ── Global status flags ───────────────────────────────────────────────────
-    online: bool = True              # if False, no response at all
-    reset_flag: bool = True          # set after power-on; cleared by Type C 0x01
-    leak_1: bool = False             # water leak detect 1
-    leak_2: bool = False             # water leak detect 2
-    analog_power_overload: bool = False
-    pwm_bank1_overload: bool = False
-    pwm_bank2_overload: bool = False
-    pwm_bank3_overload: bool = False
+    # ── Global status ──────────────────────────────────────────────────────────
+    online:                  bool = True
+    reset_flag:              bool = True
+    leak_1:                  bool = False
+    leak_2:                  bool = False
+    analog_power_overload:   bool = False
+    pwm_bank1_overload:      bool = False
+    pwm_bank2_overload:      bool = False
+    pwm_bank3_overload:      bool = False
 
-    # ── Analog inputs (AIN 0–20, 16-bit, little-endian) ─────────────────────
+    # ── Analog inputs: AIN 0–20 (21 channels, 16-bit) ────────────────────────
     analog_inputs: list[int] = field(default_factory=lambda: [0] * 21)
 
-    # ── Board health ──────────────────────────────────────────────────────────
-    # Temperature: stored as (deg_C + 100) * 100  e.g. 36.15°C = 13615
-    board_temp_raw: int = 13615
-    # Voltage: stored as voltage * 100  e.g. 24.00V = 2400
-    board_voltage_raw: int = 2400
+    # ── Digital inputs: DIN 21–23 (returned alongside AIN bank 2) ────────────
+    digital_inputs: list[bool] = field(default_factory=lambda: [False] * 3)
 
-    # ── Reply delay ───────────────────────────────────────────────────────────
-    reply_delay_100us: int = 20      # default 20 × 100µs = 2ms
+    # ── Counter inputs: CNT 0–15 (16 channels, 16-bit) ───────────────────────
+    counter_inputs: list[int] = field(default_factory=lambda: [0] * 16)
 
-    # ── Analog input mode (0=voltage, 1=current per bit for AIN 0–23) ────────
-    ain_mode: int = 0x000000         # 24 bits, 0 = voltage (Hi-Z), 1 = current (Lo-Z)
+    # ── Encoder inputs: ENC 0–11 (12 channels, 16-bit) ───────────────────────
+    encoder_inputs: list[int] = field(default_factory=lambda: [0] * 12)
 
-    # ── PWM driver status (per bank) ─────────────────────────────────────────
-    # byte: [global_err, comm_err, chip_reset_n, over_temp, n/a, open_load, stk_on, fail_save]
-    pwm1_driver_status: int = 0x04   # chip_reset_n = 1 = normal (active low)
+    # ── Digital inputs word: DIG 0–23 (3 bytes, 8 channels per byte) ─────────
+    digital_word: list[int] = field(default_factory=lambda: [0] * 3)  # [DIG0-7, DIG8-15, DIG16-23]
+
+    # ── Temperature inputs: TEMP 1–4 — raw = (deg_C + 100) × 100 ─────────────
+    # e.g. 36.15°C → 13615
+    temperature_inputs: list[int] = field(default_factory=lambda: [13615] * 4)
+
+    # ── Board health ───────────────────────────────────────────────────────────
+    board_temp_raw:    int = 13615    # (deg_C + 100) × 100
+    board_voltage_raw: int = 2400     # voltage × 100
+
+    # ── Reply delay ────────────────────────────────────────────────────────────
+    reply_delay_100us: int = 20       # default 2ms
+
+    # ── Analog input mode: 1 bit per AIN channel (0=voltage, 1=current) ───────
+    ain_mode: int = 0x000000
+
+    # ── PWM driver status (per bank) ──────────────────────────────────────────
+    pwm1_driver_status: int = 0x04
     pwm2_driver_status: int = 0x04
     pwm3_driver_status: int = 0x04
-    pwm1_overload: int = 0x00
-    pwm2_overload: int = 0x00
-    pwm3_overload: int = 0x00
+    pwm1_overload:      int = 0x00
+    pwm2_overload:      int = 0x00
+    pwm3_overload:      int = 0x00
 
     def global_status_byte(self) -> int:
-        """Build the Drivercard Global Status byte."""
         b = 0
         if self.pwm_bank1_overload:    b |= 0x01
         if self.pwm_bank2_overload:    b |= 0x02
@@ -80,112 +95,92 @@ class DeviceState:
         if self.analog_power_overload: b |= 0x08
         if self.leak_1:                b |= 0x10
         if self.leak_2:                b |= 0x20
-        # bit 6 = spare
         if self.reset_flag:            b |= 0x80
         return b
 
 
-# ── Protocol handler ──────────────────────────────────────────────────────────
-
 class ProtocolHandler:
-    """
-    Processes a MasterTelegram and returns the correct slave reply bytes.
-    Instantiate once per simulated device and call handle() for each telegram.
-    """
-
     def __init__(self, state: DeviceState | None = None):
         self.state = state or DeviceState()
 
     def handle(self, telegram: MasterTelegram) -> bytes | None:
-        """
-        Process a master telegram and return slave reply bytes.
-        Returns None if the device should not respond (offline or address mismatch).
-        """
         if not self.state.online:
-            logger.debug("Device offline — no response")
             return None
 
-        # Check address matches
         expected_addr = (0x3 << 4) | (self.state.node_address & 0x0F)
         if telegram.address_byte != expected_addr:
-            logger.debug(
-                f"Address mismatch: got 0x{telegram.address_byte:02X}, "
-                f"expected 0x{expected_addr:02X} — ignoring"
-            )
             return None
 
         if not telegram.crc_valid:
-            logger.warning(f"CRC invalid on received telegram — ignoring")
+            logger.warning("CRC invalid — ignoring telegram")
             return None
 
         if telegram.kind == TelegramKind.AB:
             return self._handle_type_ab(telegram)
         elif telegram.kind == TelegramKind.C:
             return self._handle_type_c(telegram)
-
-        logger.warning(f"Unknown telegram kind: {telegram.kind}")
         return None
 
-    # ── Type AB handler ────────────────────────────────────────────────────────
+    # ── Type AB ────────────────────────────────────────────────────────────────
 
     def _handle_type_ab(self, t: MasterTelegram) -> bytes:
-        """
-        Build the slave AB reply.
-        Structure: 0x52 | Global Status | [optional data banks] | CRC
-        """
-        payload = bytes([self.state.global_status_byte()])
+        s = self.state
+        payload = bytes([s.global_status_byte()])
 
-        # AIN Bank 0 (AIN 0–7, 16-bit little-endian words)
-        if t.ain_bank0_enabled:
+        # ── Optional A banks (AIN) ─────────────────────────────────────────────
+        if t.ain_bank0_enabled:       # AIN 0–7
             for i in range(8):
-                payload += struct.pack("<H", self.state.analog_inputs[i])
+                payload += struct.pack("<H", s.analog_inputs[i])
 
-        # AIN Bank 1 (AIN 8–15)
-        if t.ain_bank1_enabled:
+        if t.ain_bank1_enabled:       # AIN 8–15
             for i in range(8, 16):
-                payload += struct.pack("<H", self.state.analog_inputs[i])
+                payload += struct.pack("<H", s.analog_inputs[i])
 
-        # AIN Bank 2 (AIN 16–20 + DIN 21–23 as 16-bit words)
-        if t.ain_bank2_enabled:
+        if t.ain_bank2_enabled:       # AIN 16–20 + DIN 21–23
             for i in range(16, 21):
-                payload += struct.pack("<H", self.state.analog_inputs[i])
-            # DIN 21, 22, 23 — simulated as 0
-            payload += struct.pack("<H", 0)  # DIN 21
-            payload += struct.pack("<H", 0)  # DIN 22
-            payload += struct.pack("<H", 0)  # DIN 23
+                payload += struct.pack("<H", s.analog_inputs[i])
+            for din in s.digital_inputs:   # DIN 21, 22, 23 as 16-bit words
+                payload += struct.pack("<H", 1 if din else 0)
 
-        # Optional B banks — CNT, ENC, DIG, TEMP — return zeros as placeholder
-        if t.cnt_bank1_enabled:
-            payload += bytes(16)  # CNT 0–7, 2 bytes each
-        if t.cnt_bank2_enabled:
-            payload += bytes(16)  # CNT 8–15
+        # ── Optional B banks ──────────────────────────────────────────────────
+        if t.cnt_bank1_enabled:       # CNT 0–7
+            for i in range(8):
+                payload += struct.pack("<H", s.counter_inputs[i])
 
-        if t.enc_bank1_enabled:
-            payload += bytes(8)   # ENC 0–3
-        if t.enc_bank2_enabled:
-            payload += bytes(8)   # ENC 4–7
-        if t.enc_bank3_enabled:
-            payload += bytes(8)   # ENC 8–11
+        if t.cnt_bank2_enabled:       # CNT 8–15
+            for i in range(8, 16):
+                payload += struct.pack("<H", s.counter_inputs[i])
 
-        if t.dig_25pct_enabled:
-            payload += bytes(3)   # DIG 0–23 (3 bytes)
+        if t.enc_bank1_enabled:       # ENC 0–3
+            for i in range(4):
+                payload += struct.pack("<H", s.encoder_inputs[i])
 
-        if t.temp_12_enabled:
-            payload += struct.pack("<H", self.state.board_temp_raw)   # TEMP 1
-            payload += struct.pack("<H", self.state.board_temp_raw)   # TEMP 2
-        if t.temp_34_enabled:
-            payload += struct.pack("<H", self.state.board_temp_raw)   # TEMP 3
-            payload += struct.pack("<H", self.state.board_temp_raw)   # TEMP 4
+        if t.enc_bank2_enabled:       # ENC 4–7
+            for i in range(4, 8):
+                payload += struct.pack("<H", s.encoder_inputs[i])
 
-        reply = build_slave_reply(payload)
-        logger.debug(f"Type AB reply: {reply.hex()}")
-        return reply
+        if t.enc_bank3_enabled:       # ENC 8–11
+            for i in range(8, 12):
+                payload += struct.pack("<H", s.encoder_inputs[i])
 
-    # ── Type C handler ─────────────────────────────────────────────────────────
+        if t.dig_25pct_enabled:       # DIG 0–23 (3 bytes)
+            for byte_val in s.digital_word:
+                payload += bytes([byte_val])
+
+        if t.temp_12_enabled:         # TEMP 1–2
+            payload += struct.pack("<H", s.temperature_inputs[0])
+            payload += struct.pack("<H", s.temperature_inputs[1])
+
+        if t.temp_34_enabled:         # TEMP 3–4
+            payload += struct.pack("<H", s.temperature_inputs[2])
+            payload += struct.pack("<H", s.temperature_inputs[3])
+
+        return build_slave_reply(payload)
+
+    # ── Type C ────────────────────────────────────────────────────────────────
 
     def _handle_type_c(self, t: MasterTelegram) -> bytes:
         cmd = t.type_c_cmd
-        logger.debug(f"Type C command: {cmd}")
 
         if cmd == TypeCCmd.VERSION_INFO:
             return self._reply_version()
@@ -195,8 +190,6 @@ class ProtocolHandler:
             return self._reply_ack()
 
         elif cmd == TypeCCmd.DIP_SWITCH:
-            # OPTION nibble (high) = 0x4, NODE nibble (low) = node address
-            # Clamp to 0xFF max — option=4, node=0..F
             option = 0x4
             node   = self.state.node_address & 0x0F
             return build_slave_reply(bytes([(option << 4) | node]))
@@ -212,7 +205,6 @@ class ProtocolHandler:
             return self._reply_status_flags()
 
         elif cmd == TypeCCmd.ANALOG_INPUT_SETUP:
-            # Store the ain_mode from the 3 data bytes
             if len(t.payload) >= 3:
                 self.state.ain_mode = (t.payload[2] << 16) | (t.payload[1] << 8) | t.payload[0]
             return self._reply_ack()
@@ -229,32 +221,22 @@ class ProtocolHandler:
     # ── Reply builders ─────────────────────────────────────────────────────────
 
     def _reply_ack(self) -> bytes:
-        """ACK reply: 0x52 0x06 CRC"""
         return build_slave_reply(bytes([0x06]))
 
     def _reply_version(self) -> bytes:
         s = self.state
-        payload = bytes([
-            s.fw_version,
-            s.fw_sub_version,
-            s.fw_day,
-            s.fw_month,
-            s.fw_year,
-            0x01 if s.reset_flag else 0x00   # RST
-        ])
-        return build_slave_reply(payload)
+        return build_slave_reply(bytes([
+            s.fw_version, s.fw_sub_version,
+            s.fw_day, s.fw_month, s.fw_year,
+            0x01 if s.reset_flag else 0x00
+        ]))
 
     def _reply_status_flags(self) -> bytes:
         s = self.state
         payload = bytes([
-            s.pwm1_driver_status,
-            s.pwm1_overload,
-            s.pwm2_driver_status,
-            s.pwm2_overload,
-            s.pwm3_driver_status,
-            s.pwm3_overload,
-            0x00,  # APW 0–7 overload
-            0x00,  # APW 8–15 overload
-            0x00,  # APW 16–23 overload
+            s.pwm1_driver_status, s.pwm1_overload,
+            s.pwm2_driver_status, s.pwm2_overload,
+            s.pwm3_driver_status, s.pwm3_overload,
+            0x00, 0x00, 0x00,   # APW overloads 0–7, 8–15, 16–23
         ]) + struct.pack("<H", s.board_temp_raw) + struct.pack("<H", s.board_voltage_raw)
         return build_slave_reply(payload)
