@@ -1,0 +1,24 @@
+{
+  "connection": {
+    "mode": "TCP",
+    "tcp": {
+      "host": "0.0.0.0",
+      "port": 4001
+    },
+    "serial": {
+      "port": "COM1",
+      "baud_rate": 9600,
+      "parity": "N",
+      "stop_bits": 1,
+      "data_bits": 8
+    }
+  },
+  "device": {
+    "online": true,
+    "simulate_fault": false,
+    "auto_respond": true
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}
