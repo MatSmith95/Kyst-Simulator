@@ -489,7 +489,7 @@ class MainWindow:
     def _on_cnt_change(self, idx, var):
         try:
             self.device_state.counter_inputs[idx] = int(var.get())
-        except (ValueError, tk.TclError):
+        except (ValueError, Exception):
             pass
 
     def _on_enc_change(self, idx, var):
